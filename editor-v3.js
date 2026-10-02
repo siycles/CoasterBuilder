@@ -645,10 +645,17 @@ function animate(now) {
     const progress = Math.min(state.rideDistance / length, 0.9999);
     const position = state.curve.getPointAt(progress);
     const tangent = state.curve.getTangentAt(progress).normalize();
+    const bank = bankAt(state.curve, progress);
+    const cameraUp = worldUp.clone().addScaledVector(tangent, -worldUp.dot(tangent));
+    if (cameraUp.lengthSq() < 0.001) {
+      cameraUp.set(1, 0, 0).addScaledVector(tangent, -tangent.x);
+    }
+    camera.up.copy(cameraUp.normalize().applyAxisAngle(tangent, bank));
     camera.position.copy(position).add(new THREE.Vector3(0, 1.35, 0));
     camera.lookAt(position.clone().addScaledVector(tangent, 6).add(new THREE.Vector3(0, 0.3, 0)));
     $('ride-speed').textContent = `${Math.round(state.rideSpeed * 3.6)}`;
   } else {
+    camera.up.copy(worldUp);
     moveCamera(delta);
     updateCamera();
   }
@@ -704,24 +711,52 @@ function joinRoom() {
   if (!/^[A-Z0-9]{6,8}$/.test(code)) return notify('Enter a 6–8 character room code.');
   if (!window.Peer) return notify('Room networking could not load.');
   state.peer?.destroy();
-  state.peer = new window.Peer();
-  const connection = state.peer.connect(code, { reliable: true });
+  const peer = new window.Peer();
+  state.peer = peer;
+  $('join-submit').disabled = true;
+  $('join-submit').textContent = 'Connecting…';
   let received = false;
-  const timeout = setTimeout(() => { if (!received) notify('Room not found. Check the code and make sure the host is online.'); }, 10000);
-  connection.on('open', () => connection.on('data', message => {
-    if (message?.type === 'ride') {
-      received = true;
-      clearTimeout(timeout);
-      state.connections = [connection];
-      state.roomCode = code;
-      acceptRide(message.data);
-      updateNetworkUI();
-      $('join-dialog').close();
-      connection.send({ type: 'request-start' });
-      notify('Joined the ride. Waiting for the host to start.');
-    } else if (message?.type === 'start') startRide(false);
-  }));
-  connection.on('error', () => notify('Could not connect to that room.'));
+  let settled = false;
+  let connection = null;
+  const timeout = setTimeout(() => fail('Room not found. Check the code and make sure the host is online.'), 12000);
+  const fail = message => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    notify(message);
+    $('join-submit').disabled = false;
+    $('join-submit').textContent = 'Connect';
+    peer.destroy();
+  };
+  peer.on('open', () => {
+    connection = peer.connect(code, { reliable: true });
+    connection.on('data', message => {
+      if (message?.type === 'ride') {
+        if (!Array.isArray(message.data?.points)) return fail('That room sent an invalid coaster layout.');
+        received = true;
+        settled = true;
+        clearTimeout(timeout);
+        state.connections = [connection];
+        state.roomCode = code;
+        acceptRide(message.data);
+        updateNetworkUI();
+        $('join-dialog').close();
+        notify('Connected. Waiting for the host to start the ride.');
+      } else if (message?.type === 'start') startRide(false);
+    });
+    connection.on('error', () => fail('Could not connect to that room.'));
+    connection.on('close', () => {
+      if (state.guest) {
+        state.guest = false;
+        state.roomCode = '';
+        state.connections = [];
+        updateNetworkUI();
+        setViewMode('build');
+        notify('The host left the room.');
+      } else if (!received) fail('The host closed the room.');
+    });
+  });
+  peer.on('error', error => fail(`Room connection failed: ${error.type}.`));
 }
 
 function resetCamera() {
@@ -783,3 +818,10 @@ updateCamera();
 resize();
 rebuild();
 requestAnimationFrame(animate);
+
+const incomingRoomCode = new URLSearchParams(window.location.search).get('join');
+if (incomingRoomCode && /^[A-Z0-9]{6,8}$/i.test(incomingRoomCode)) {
+  $('join-code').value = incomingRoomCode.toUpperCase();
+  $('join-dialog').showModal();
+  joinRoom();
+}
